@@ -141,19 +141,29 @@ function bandLuminance(w, h, values) {
 }
 
 async function main() {
-  const [modelPath, photoPath, outDirArg, shortSideArg] = process.argv.slice(2);
+  const [modelPath, photoPath, outDirArg, shortSideArg, optArg] = process.argv.slice(2);
   if (!modelPath || !photoPath) {
     console.error(
-      "用法: node tools/check_da3_model.mjs <model.onnx> <photo.jpg|png> [outDir] [shortSide]",
+      "用法: node tools/check_da3_model.mjs <model.onnx> <photo.jpg|png> [outDir] [shortSide] [optLevel]",
     );
     process.exit(2);
   }
   const outDir = outDirArg ?? "tools/out";
   const shortSide = Number(shortSideArg ?? 768);
+  // optLevel: all（默认）/ disable / basic —— 对照图优化对内存峰值的影响
+  const optimizationLevel = optArg ?? "all";
   mkdirSync(outDir, { recursive: true });
 
   console.log(`模型: ${modelPath}`);
   console.log(`照片: ${photoPath}`);
+
+  // RSS 采样（含 ONNX Runtime 的 native 分配），每 50ms 记峰值
+  let peakRss = process.memoryUsage().rss;
+  const sampler = setInterval(() => {
+    const rss = process.memoryUsage().rss;
+    if (rss > peakRss) peakRss = rss;
+  }, 50);
+  const mb = (n) => (n / 1048576).toFixed(0);
 
   // --- 预处理（与 SpatialDepth.generate 同构） ---
   const src = decodeImage(photoPath);
@@ -169,9 +179,10 @@ async function main() {
   const t0 = performance.now();
   const session = await ort.InferenceSession.create(modelPath, {
     executionProviders: ["cpu"],
+    optimizationLevel,
   });
   const tInit = performance.now() - t0;
-  console.log(`会话创建耗时: ${tInit.toFixed(0)} ms`);
+  console.log(`会话创建耗时: ${tInit.toFixed(0)} ms（optimizationLevel=${optimizationLevel}）`);
   console.log(`输入名: ${JSON.stringify(session.inputNames)}`);
   console.log(`输出名: ${JSON.stringify(session.outputNames)}`);
   if (session.inputNames.length !== 1) {
@@ -185,6 +196,8 @@ async function main() {
   const results = await session.run(feeds);
   const tInfer = performance.now() - t1;
   console.log(`推理耗时: ${tInfer.toFixed(0)} ms`);
+  clearInterval(sampler);
+  console.log(`RSS 峰值: ${mb(peakRss)} MB（当前 ${mb(process.memoryUsage().rss)} MB）`);
 
   for (const name of session.outputNames) {
     const t = results[name];

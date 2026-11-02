@@ -1,0 +1,218 @@
+#!/usr/bin/env node
+/**
+ * 空间壁纸缓存包导出（PC 侧计算，绕开手机端 DA3-Base 推理的内存尖峰）。
+ *
+ * 用法：
+ *   node tools/export_spatial_cache.mjs <photo.jpg|png> <model.onnx> <shortSide> [outZip]
+ *
+ * 例：
+ *   node tools/export_spatial_cache.mjs D:/pic/a.jpg \
+ *     ../app/src/main/assets/models/da3_base_int8.onnx 1024 out/a.zip
+ *
+ * 产物（zip 内三个文件，平铺、无子目录）：
+ *   source     —— 图片原始字节（与 App 选图时拷入的 source 完全一致）
+ *   depth.png  —— 灰度深度图，**越亮 = 越近**（min-max + INVERT，与 SpatialDepth 同构）
+ *   meta.json  —— 与 App 相同 schema（model 字段以模型文件名开头，供缓存校验）
+ *
+ * 缓存键 = sha256(source).hex 前 16 位（与 App 的 sha16 一致）；zip 名即 <key>.zip。
+ * 导入：把 zip 推到手机（adb push），App 空间壁纸页 →「导入缓存包」。
+ * 层图（layers）不在包里 —— 那是 Kotlin/设备侧逻辑，导入后在手机上秒级补算。
+ *
+ * 预处理与 App SpatialDepth.generate 同构：短边 → 对齐 14 → ImageNet 归一化（gamma 空间）。
+ * 缩放用双线性（App 是 Catmull-Rom；DA 对锐度不敏感，RMSE 1~3/255，见 SpatialResample 注释）。
+ */
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { dirname, basename, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import jpeg from "jpeg-js";
+import { PNG } from "pngjs";
+import AdmZip from "adm-zip";
+import ort from "onnxruntime-node";
+
+const MEAN = [0.485, 0.456, 0.406];
+const STD = [0.229, 0.224, 0.225];
+const MULT = 14;
+/** 与 SpatialDepth.INVERT_DEPTH 一致：DA3 输出是距离（越大越远），翻转成越亮=越近。 */
+const INVERT_DEPTH = true;
+
+function decodeImage(path) {
+  const buf = readFileSync(path);
+  if (path.toLowerCase().endsWith(".png")) {
+    const png = PNG.sync.read(buf);
+    const px = new Uint32Array(png.width * png.height);
+    for (let i = 0; i < px.length; i++) {
+      const o = i * 4;
+      px[i] =
+        ((png.data[o + 3] & 0xff) << 24) |
+        ((png.data[o] & 0xff) << 16) |
+        ((png.data[o + 1] & 0xff) << 8) |
+        (png.data[o + 2] & 0xff);
+    }
+    return { width: png.width, height: png.height, px };
+  }
+  const raw = jpeg.decode(buf, { useTArray: true, formatAsRGBA: true });
+  const px = new Uint32Array(raw.width * raw.height);
+  for (let i = 0; i < px.length; i++) {
+    const o = i * 4;
+    px[i] =
+      (0xff << 24) |
+      ((raw.data[o] & 0xff) << 16) |
+      ((raw.data[o + 1] & 0xff) << 8) |
+      (raw.data[o + 2] & 0xff);
+  }
+  return { width: raw.width, height: raw.height, px };
+}
+
+function resizeBilinear(src, dw, dh) {
+  const out = new Uint32Array(dw * dh);
+  const sx = src.width / dw;
+  const sy = src.height / dh;
+  for (let y = 0; y < dh; y++) {
+    const fy = (y + 0.5) * sy - 0.5;
+    const y0 = Math.max(0, Math.min(src.height - 1, Math.floor(fy)));
+    const y1 = Math.min(src.height - 1, y0 + 1);
+    const wy = Math.max(0, Math.min(1, fy - y0));
+    for (let x = 0; x < dw; x++) {
+      const fx = (x + 0.5) * sx - 0.5;
+      const x0 = Math.max(0, Math.min(src.width - 1, Math.floor(fx)));
+      const x1 = Math.min(src.width - 1, x0 + 1);
+      const wx = Math.max(0, Math.min(1, fx - x0));
+      const c00 = src.px[y0 * src.width + x0];
+      const c01 = src.px[y0 * src.width + x1];
+      const c10 = src.px[y1 * src.width + x0];
+      const c11 = src.px[y1 * src.width + x1];
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      for (const [c, k] of [
+        [c00, (1 - wx) * (1 - wy)],
+        [c01, wx * (1 - wy)],
+        [c10, (1 - wx) * wy],
+        [c11, wx * wy],
+      ]) {
+        r += ((c >>> 24) & 0xff) * k;
+        g += ((c >>> 16) & 0xff) * k;
+        b += ((c >>> 8) & 0xff) * k;
+      }
+      out[y * dw + x] =
+        (0xff << 24) | (Math.round(r) << 16) | (Math.round(g) << 8) | Math.round(b);
+    }
+  }
+  return { width: dw, height: dh, px: out };
+}
+
+function toNchw(img) {
+  const n = img.width * img.height;
+  const chw = new Float32Array(3 * n);
+  for (let i = 0; i < n; i++) {
+    const c = img.px[i];
+    chw[i] = (((c >>> 16) & 0xff) / 255 - MEAN[0]) / STD[0];
+    chw[n + i] = (((c >>> 8) & 0xff) / 255 - MEAN[1]) / STD[1];
+    chw[2 * n + i] = ((c & 0xff) / 255 - MEAN[2]) / STD[2];
+  }
+  return chw;
+}
+
+async function main() {
+  const [photoArg, modelArg, shortSideArg, outZipArg] = process.argv.slice(2);
+  if (!photoArg || !modelArg || !shortSideArg) {
+    console.error(
+      "用法: node tools/export_spatial_cache.mjs <photo.jpg|png> <model.onnx> <shortSide> [outZip]",
+    );
+    process.exit(2);
+  }
+  const photoPath = resolve(photoArg);
+  const modelPath = resolve(modelArg);
+  const modelName = basename(modelPath);
+  const shortSide = Number(shortSideArg);
+  if (![768, 896, 1024].includes(shortSide)) {
+    console.error(`shortSide 必须是 App 合法档位之一（768/896/1024），收到: ${shortSide}`);
+    process.exit(2);
+  }
+
+  const sourceBytes = readFileSync(photoPath);
+
+  // --- 预处理（与 SpatialDepth.generate 同构） ---
+  const src = decodeImage(photoPath);
+  const scale = shortSide / Math.min(src.width, src.height);
+  const w = Math.max(MULT, Math.floor(Math.round(src.width * scale) / MULT) * MULT);
+  const h = Math.max(MULT, Math.floor(Math.round(src.height * scale) / MULT) * MULT);
+  const chw = toNchw(resizeBilinear(src, w, h));
+  console.log(`图片 ${src.width}×${src.height} → 推理 ${w}×${h}（短边 ${shortSide}）`);
+  console.log(`模型 ${modelName}`);
+
+  // --- 推理 ---
+  const session = await ort.InferenceSession.create(modelPath, {
+    executionProviders: ["cpu"],
+  });
+  const input = new ort.Tensor("float32", chw, [1, 1, 3, h, w]);
+  const t0 = performance.now();
+  const results = await session.run({ [session.inputNames[0]]: input });
+  const costMs = Math.round(performance.now() - t0);
+  console.log(`推理耗时 ${costMs} ms`);
+
+  const tensor = results["predicted_depth"] ?? results[session.outputNames[0]];
+  if (!tensor) throw new Error("没有 predicted_depth 输出");
+  const dims = tensor.dims;
+  const oh = dims.length === 4 ? dims[2] : dims[1];
+  const ow = dims.length === 4 ? dims[3] : dims[2];
+  if (ow !== w || oh !== h) throw new Error(`输出尺寸 ${ow}×${oh} 与输入 ${w}×${h} 不符`);
+
+  // --- min-max 归一化 + 方向翻转（越亮 = 越近） ---
+  const data = tensor.data;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (let i = 0; i < data.length; i++) {
+    const v = data[i];
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  const range = hi - lo > 1e-6 ? hi - lo : 1;
+  const png = new PNG({ width: ow, height: oh });
+  for (let i = 0; i < ow * oh; i++) {
+    const norm = (data[i] - lo) / range;
+    const g = Math.round((INVERT_DEPTH ? 1 - norm : norm) * 255);
+    png.data[i * 4] = g;
+    png.data[i * 4 + 1] = g;
+    png.data[i * 4 + 2] = g;
+    png.data[i * 4 + 3] = 255;
+  }
+
+  // --- 缓存键：sha256(source) 前 16 hex（与 App sha16 一致） ---
+  const key = createHash("sha256").update(sourceBytes).digest("hex").slice(0, 16);
+
+  const meta = {
+    srcW: src.width,
+    srcH: src.height,
+    shortSide,
+    inferW: w,
+    inferH: h,
+    outW: ow,
+    outH: oh,
+    costMs,
+    depthMin: lo,
+    depthMax: hi,
+    model: `${modelName} (int8, PC export, onnxruntime-node)`,
+    createdAt: Date.now(),
+  };
+
+  const outZip = resolve(outZipArg ?? `out/${key}.zip`);
+  mkdirSync(dirname(outZip), { recursive: true });
+  const zip = new AdmZip();
+  zip.addFile("source", sourceBytes);
+  zip.addFile("depth.png", PNG.sync.write(png));
+  zip.addFile("meta.json", Buffer.from(JSON.stringify(meta), "utf8"));
+  zip.writeZip(outZip);
+
+  await session.release?.();
+  console.log(`缓存键 ${key}`);
+  console.log(`导出 ${outZip}`);
+  console.log(`下一步：`);
+  console.log(`  adb push "${outZip}" /sdcard/Download/`);
+  console.log(`  手机 App → 空间壁纸 →「导入缓存包」选这个 zip`);
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

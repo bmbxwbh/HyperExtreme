@@ -10,6 +10,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.SystemClock
 import android.util.Log
+import com.frederic22.hyperextreme.data.RunLog
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -267,6 +268,14 @@ internal object SpatialDepth {
             Log.i(TAG, "缓存命中 $key（$fileName @$target）")
             return Result(dir, 0L, true)
         }
+
+        // 起始记录落 run_log（2026-11-02）：logcat 里的 SPATIAL 日志有时抓不到（原因未明），
+        // 而进程若在推理中被 lmkd 杀掉，文件里会留下这条「开始」而没有「完成」⇒ 能定位崩溃阶段。
+        RunLog.append(
+            ctx,
+            "空间壁纸 · 推理开始",
+            listOf("模型：$fileName", "短边：$target", "force=$force", "键：$key"),
+        )
 
         val t0 = SystemClock.elapsedRealtime()
 

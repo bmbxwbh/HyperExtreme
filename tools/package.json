@@ -4,6 +4,7 @@
   "type": "module",
   "description": "空间壁纸深度模型离线验证工具（check_da3_model.mjs）",
   "dependencies": {
+    "adm-zip": "^0.6.1",
     "jpeg-js": "^0.4.4",
     "onnxruntime-node": "^1.23.2",
     "pngjs": "^7.0.0"

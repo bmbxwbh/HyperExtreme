@@ -51,6 +51,7 @@ import com.frederic22.hyperextreme.data.MaskPrefs
 import com.frederic22.hyperextreme.data.SpatialControl
 import com.frederic22.hyperextreme.data.RunLog
 import com.frederic22.hyperextreme.spatial.SpatialDepth
+import com.frederic22.hyperextreme.spatial.SpatialImport
 import com.frederic22.hyperextreme.spatial.SpatialLayers
 import com.frederic22.hyperextreme.wallpaper.SpatialServiceMode
 import com.frederic22.hyperextreme.wallpaper.SpatialServiceTarget
@@ -352,6 +353,59 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
         }
     }
 
+    // 导入缓存包（2026-11-02 用户方案：深度在 PC 上用 `tools/export_spatial_cache.mjs`
+    // 算好打 zip 推到手机）—— 彻底绕开 DA3-Base 手机推理的 5~7GB 内存尖峰（lmkd 闪退）。
+    val importPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) {
+            busy = true
+            scope.launch {
+                val result = withContext(Dispatchers.IO) {
+                    runCatching { SpatialImport.install(ctx, uri) }
+                }
+                busy = false
+                result.fold(
+                    onSuccess = { k ->
+                        // 与「选图」同一套状态回写：候选键 + 预览 + lastKey（层图在才认）
+                        sourceKey = k
+                        prefs.setSpatialSourceKey(k)
+                        picked = null
+                        preview = withContext(Dispatchers.IO) {
+                            SpatialDepth.decodePreview(
+                                SpatialDepth.sourceFile(File(SpatialDepth.cacheRoot(ctx), k)),
+                            )
+                        }
+                        val dir = File(SpatialDepth.cacheRoot(ctx), k)
+                        if (SpatialLayers.hasLayers(dir)) {
+                            lastKey = k
+                            prefs.setSpatialLastKey(k)
+                        } else {
+                            lastKey = null
+                        }
+                        Toast.makeText(
+                            ctx,
+                            "导入成功：深度已就绪，点「生成深度缓存」秒级补算层图后即可替换",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        SpatialImport.logResult(
+                            ctx, true,
+                            listOf("缓存键：$k", "来源：缓存包导入（PC 计算）"),
+                        )
+                    },
+                    onFailure = { e ->
+                        val msg = e.message ?: e.javaClass.simpleName
+                        Toast.makeText(ctx, "导入失败：$msg", Toast.LENGTH_LONG).show()
+                        SpatialImport.logResult(
+                            ctx, false,
+                            listOf("失败：${e.javaClass.name}: $msg"),
+                        )
+                    },
+                )
+            }
+        }
+    }
+
     // **必须 remember**：`Color.luminance()` 有浮点运算，且主题对象每帧读一次没意义。
     val scheme = MiuixTheme.colorScheme
     val previewSurface = remember(scheme.surface) {
@@ -472,6 +526,19 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                             preview = null
                             sourceKey = null
                             prefs.setSpatialSourceKey(null)
+                        },
+                        modifier = Modifier.weight(1f),
+                        enabled = !locked && !busy,
+                    )
+                    TextButton(
+                        text = "导入缓存包",
+                        onClick = {
+                            haptic()
+                            // zip = PC 侧 `tools/export_spatial_cache.mjs` 的产物
+                            // （source + depth.png + meta.json 平铺三件套）
+                            importPicker.launch(
+                                arrayOf("application/zip", "application/octet-stream"),
+                            )
                         },
                         modifier = Modifier.weight(1f),
                         enabled = !locked && !busy,
