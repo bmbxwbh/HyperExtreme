@@ -147,11 +147,13 @@ internal object SpatialDepth {
     }
 
     /** meta 是否与本次请求的模型/档位一致（读失败一律视为不命中 → 重算）。 */
-    private fun metaMatches(metaFile: File, model: String, shortSide: Int): Boolean = runCatching {
-        val meta = JSONObject(metaFile.readText())
+    private fun metaMatches(metaFile: File, model: String, shortSide: Int): Boolean {
         val fileName = MODEL_NAMES[model] ?: return false
-        meta.optString("model").startsWith(fileName) && meta.optInt("shortSide") == shortSide
-    }.getOrDefault(false)
+        return runCatching {
+            val meta = JSONObject(metaFile.readText())
+            meta.optString("model").startsWith(fileName) && meta.optInt("shortSide") == shortSide
+        }.getOrDefault(false)
+    }
 
     /** 缓存目录里的原图文件（可能不存在）。 */
     fun sourceFile(depthDir: File): File = File(depthDir, SOURCE_NAME)

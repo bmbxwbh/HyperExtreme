@@ -1,6 +1,7 @@
 // `java` 在这个脚本里被 Gradle 的 java 插件扩展占用，用别名 import 绕开，
 // 否则 `java.util.Properties` 会被解析成 `JavaPluginExtension.util`。
 import java.util.Properties as JavaProperties
+import java.io.File
 
 plugins {
     alias(libs.plugins.android.application)
