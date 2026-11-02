@@ -130,8 +130,95 @@ dependencies {
     // 悬浮底栏（从 HyperChanger 移植：Apache-2.0）用到的液态玻璃与形状库
     implementation(libs.kyant.backdrop)
     implementation(libs.kyant.shapes)
-    // 空间壁纸的深度推理（Depth Anything V2 ViT-S int8）。
-    // **完整版**：mobile（minimal build）缺 ConvInteger 等算子，实测跑不动这个模型，
-    // 2026-10-22 用户决定退回完整版（so 17.8MB），模型直接用 `.onnx`。
+    // 空间壁纸的深度推理（Depth Anything 3，Small + Base 双模型，2026-11-02 换代）。
+    // **完整版**：mobile（minimal build）缺 ConvInteger / MatMulNBits 等算子，实测跑不动
+    // 动态量化模型（2026-10-22），DA3-Base 的 MatMulNBits 同样只有完整版带全 kernel
+    // （so 17.8MB），模型直接用 `.onnx`。
     implementation(libs.onnxruntime.android)
 }
+
+// ---------------------------------------------------------------------------
+// DA3-Base 模型（123MB）：超过 GitHub 单文件 100MB 上限，不入库。
+// 构建时从 HuggingFace 下载 + SHA-256 校验，落在 `src/main/assets/models/`
+// （默认 main asset 源，merge*Assets 自动打包进 APK ⇒ APK 里照样"内置"）。
+// 校验失败会响亮报错；网络不通可手动下载放到同一路径后重试。
+// ---------------------------------------------------------------------------
+val da3BaseModelFile = file("src/main/assets/models/da3_base_int8.onnx")
+val da3BaseUrls = listOf(
+    "https://huggingface.co/jlampel/depth-anything-3-base-onnx-int8/resolve/main/da3_base_int8.onnx",
+    "https://hf-mirror.com/jlampel/depth-anything-3-base-onnx-int8/resolve/main/da3_base_int8.onnx",
+)
+val da3BaseSha256 = "86dd3200ed2506fe4d394b6526691f5c4591d88f51d3f42520aaee0b85387aaf"
+
+fun sha256Hex(f: File): String {
+    val md = java.security.MessageDigest.getInstance("SHA-256")
+    f.inputStream().use { ins ->
+        val buf = ByteArray(1 shl 16)
+        while (true) {
+            val r = ins.read(buf)
+            if (r <= 0) break
+            md.update(buf, 0, r)
+        }
+    }
+    return md.digest().joinToString("") { "%02x".format(it) }
+}
+
+val fetchDa3BaseModel = tasks.register("fetchDa3BaseModel") {
+    inputs.property("urls", da3BaseUrls.joinToString("|"))
+    inputs.property("sha256", da3BaseSha256)
+    outputs.file(da3BaseModelFile)
+    doLast {
+        if (da3BaseModelFile.isFile && sha256Hex(da3BaseModelFile) == da3BaseSha256) {
+            logger.lifecycle("fetchDa3BaseModel：已存在且校验通过，跳过下载")
+            return@doLast
+        }
+        var lastErr: String = "未知错误"
+        for (url in da3BaseUrls) {
+            try {
+                logger.lifecycle("fetchDa3BaseModel：下载 $url")
+                val tmp = File(da3BaseModelFile.parentFile, "${da3BaseModelFile.name}.tmp")
+                if (tmp.exists()) tmp.delete()
+                val md = java.security.MessageDigest.getInstance("SHA-256")
+                java.net.URI(url).toURL().openStream().use { ins ->
+                    java.io.FileOutputStream(tmp).use { outs ->
+                        val buf = ByteArray(1 shl 16)
+                        while (true) {
+                            val r = ins.read(buf)
+                            if (r <= 0) break
+                            outs.write(buf, 0, r)
+                            md.update(buf, 0, r)
+                        }
+                    }
+                }
+                val hex = md.digest().joinToString("") { "%02x".format(it) }
+                if (hex == da3BaseSha256) {
+                    if (da3BaseModelFile.exists()) da3BaseModelFile.delete()
+                    check(tmp.renameTo(da3BaseModelFile)) {
+                        "模型落盘失败：${da3BaseModelFile.absolutePath}"
+                    }
+                    logger.lifecycle(
+                        "fetchDa3BaseModel：完成并校验通过（${da3BaseModelFile.length()} 字节）",
+                    )
+                    return@doLast
+                }
+                tmp.delete()
+                lastErr = "SHA-256 不匹配（$url）：$hex"
+                logger.warn("fetchDa3BaseModel：$lastErr")
+            } catch (e: Exception) {
+                lastErr = "${e.javaClass.simpleName}: ${e.message}（$url）"
+                logger.warn("fetchDa3BaseModel：下载失败，$lastErr")
+            }
+        }
+        throw GradleException(
+            "DA3-Base 模型获取失败：$lastErr\n" +
+                "可手动下载 ${da3BaseUrls.first()} 放到 " +
+                "${da3BaseModelFile.absolutePath} 后重试（SHA-256 必须为 $da3BaseSha256）。\n" +
+                "若网络需要代理：在 gradle.properties 配置 systemProp.http(s).proxyHost/Port。",
+        )
+    }
+}
+
+// preBuild 与资产合并都依赖它：fresh clone 第一次 assembleRelease 会先下载模型。
+tasks.named("preBuild") { dependsOn(fetchDa3BaseModel) }
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }
+    .configureEach { dependsOn(fetchDa3BaseModel) }

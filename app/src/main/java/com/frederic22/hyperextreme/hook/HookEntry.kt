@@ -1392,7 +1392,7 @@ class HookEntry : XposedModule() {
          * 起因：排查时连续几轮都只能看到旧的「已挂」日志，无法区分"没装新包"和"新逻辑没跑到"。
          * **每次改动都更新它。**
          */
-        const val BUILD_TAG = "2026-11-02.13-40 v1.5.99（关于页开源许可清单收口：libxposed 地址改官方仓库、DA V2 补 Small、HyperChanger 标 v1.1.3（上游已换 AGPL）、补 ONNX Runtime 与 PatchMatch 两条 MIT）"
+        const val BUILD_TAG = "2026-11-02.19-50 v1.6.0（深度模型换代 DA3 双模型：Small/Base 内置可选、界面加「推理模型」下拉、预算 10s→120s、缓存按 meta 失效、层图 FORMAT 66、GitHub Actions 构建）"
 
         /** 第二个作用域（2026-09-28 起）：只为了锁屏那个「自定义锁屏」按钮的层级。 */
         const val SYSTEM_UI_PACKAGE = "com.android.systemui"

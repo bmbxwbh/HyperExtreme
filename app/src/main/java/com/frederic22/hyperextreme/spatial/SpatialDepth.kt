@@ -20,54 +20,80 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * 空间壁纸：深度图生成（2026-10-22 恢复，v1.3.44）。
+ * 空间壁纸：深度图生成（2026-11-02 换代 Depth Anything 3 双模型）。
  *
  * ## 用的什么
  *
- * Depth Anything V2 **ViT-S int8**，跑在 **ONNX Runtime 完整版 1.31.0**。
- * 模型是 `assets/models/dav2_small_int8.onnx`（全量动态量化，26MB）。
+ * **Depth Anything 3（DA3，ByteDance Seed，arXiv:2511.10647）**，跑在
+ * **ONNX Runtime 完整版 1.31.0**，两档可选（UI「推理模型」下拉，默认 base）：
  *
- * ⚠️ **2026-10-22 试过 mobile（minimal build，7.2MB AAR）失败了**：mobile 的 so 里
- * 没有 `ConvInteger` kernel（`quantize_dynamic` 会把 `patch_embed` 的 Conv 量化成它），
- * 报 `ORT_NOT_IMPLEMENTED: Could not find an implementation for ConvInteger(10)`。
- * 只量化 MatMul 重新出一版、绕开 ConvInteger 之后仍然失败 ⇒ 用户决定**退回完整版**。
- * 别再把依赖换回 `onnxruntime-mobile`，除非换模型（见《07-坑点台账.md》§7.13）。
+ * * `models/da3_base_int8.onnx` —— DA3-Base，123MB，MatMulNBits int8 + fp16 存储
+ *   （HF `jlampel/depth-anything-3-base-onnx-int8`，构建时由 Gradle 下载+SHA 校验，不入库）；
+ * * `models/da3_small_int8.onnx` —— DA3-Small q8，29MB，动态量化
+ *   （HF `en970/depth-anything-v3-small-onnx`，入库）。
  *
- * ## 定死的参数（见《04-功能设计存档.md》需求四）
+ * 两者均 **Apache-2.0**（DA3 只有 Small/Base 是；Large/Giant/Nested 是 CC-BY-NC，不用）。
+ * 官方预处理与旧 DA2 完全一致：resize 到 14 倍数 → /255 → ImageNet mean/std（gamma 空间）。
  *
- * * 推理短边从 `SHORT_SIDES = [768, 896, 1024]` 里选，**默认 768**（518 边界毛糙有断线、
- *   1024 真机约 16s）；对齐到 14 的倍数（768 → 756）；
- * * **输出尺寸 = 所选档位对齐后的尺寸，不再放大到长边 1920** —— 深度是低频图，
- *   放大会插值出假细节（2026-10-22 用户定案「短边就是所选值」）；
- * * 单张 **10 秒内**，超时/质量不达标 = 直接失败，**不做 2 层降级**。
+ * ⚠️ **别把依赖换回 `onnxruntime-mobile`**：mobile 的 so 缺 `ConvInteger`（动态量化模型），
+ * 而 DA3-Base 用的 `MatMulNBits` 也只有完整版带全 kernel（2026-10-22 实测教训 + 本次换代沿用）。
+ *
+ * ## 定死的参数（2026-11-02 更新）
+ *
+ * * 推理短边从 `SHORT_SIDES = [768, 896, 1024]` 里选，**默认 768**，对齐到 14 的倍数；
+ * * **输出尺寸 = 所选档位对齐后的尺寸，不放大** —— 深度是低频图，放大会插值出假细节；
+ * * 单张 **120 秒预算**（2026-11 用户定案，替换原 10 秒上限；DA3-Base@768 预计 20~25s），
+ *   超预算/质量不达标 = 直接失败，**不做降级**（代码里没有超时看门狗，仅是约定）。
  *
  * ## 缓存
  *
  * `files/spatial/<sha256前16位>/depth.png`（灰度，**越亮 = 越近**，min-max 归一化到 0~255）
- * + 同目录 `meta.json`。缓存键 = **图片内容 sha256 前 16 位** ⇒ 换图必重算、同图直接命中。
+ * + 同目录 `meta.json`。缓存键 = **图片内容 sha256 前 16 位**；命中还必须
+ * **`meta.model` 与 `meta.shortSide` 都对得上**（换模型/换档位自动重算，DA2 旧缓存作废）。
  *
  * ## 三个必须照做的坑（见《07-坑点台账.md》§7.13）
  *
- * 1. **模型不能 `assets.open().readBytes()` 建 session**：ORT 内部再复制一份 ⇒ 峰值 52MB+，
+ * 1. **模型不能 `assets.open().readBytes()` 建 session**：ORT 内部再复制一份 ⇒ 峰值翻倍，
  *    低内存设备上 Activity 被回收（现象是「点按钮后自动退回功能页」，不是崩溃）。
  *    这里先把资产**流式拷到 `files/models/`**，再用路径 `createSession(path)`。
  * 2. **`ai.onnxruntime.**` 必须整包 keep**（`proguard-rules.pro`），native 层按类名反射，
  *    改名就 `SIGABRT`。
- * 3. **线程数不要压低**：之前为排查刷新率下调过，2026-10-22 用户明确「可以升回去」⇒
- *    现在按 CPU 核数给满（`availableProcessors`）。
+ * 3. **线程数**：按 `min(6, availableProcessors)`（8 Gen 3 全开 8 线程会抖到小核，更慢）。
  */
 internal object SpatialDepth {
 
     private const val TAG = "SPATIAL_DEPTH"
 
-    private const val MODEL_ASSET = "models/dav2_small_int8.onnx"
-    private const val MODEL_NAME = "dav2_small_int8.onnx"
+    /**
+     * 可选模型（key = UI/偏好的取值，value = asset 路径）。**顺序即 UI 下拉顺序**，`base` 在前 = 默认。
+     * 必须与 `MaskPrefs.SPATIAL_MODEL_CHOICES` 一致。
+     */
+    val MODEL_ASSETS: Map<String, String> = linkedMapOf(
+        "base" to "models/da3_base_int8.onnx",
+        "small" to "models/da3_small_int8.onnx",
+    )
+
+    /** 模型 key → 文件名（缓存 meta 校验、日志用）。 */
+    private val MODEL_NAMES: Map<String, String> = MODEL_ASSETS.mapValues { (_, asset) ->
+        asset.substringAfterLast('/')
+    }
+
+    /**
+     * DA3 输出方向翻转：官方 `predicted_depth` 是**距离**（越大越远），而本管线约定
+     * 灰度**越亮 = 越近** ⇒ 需要翻转。
+     *
+     * 由 `tools/check_da3_model.mjs` 离线验证（2026-11-02，1280×853 风景照 @756×1148）：
+     * 原向上 30% 行（天空）平均 128 vs 下 30%（地面）32 ⇒ 原向是「远=亮」，
+     * 翻转后地面 223 > 天空 127，符合「越亮=越近」。两个模型（Small q8 / Base int8）
+     * 结论一致。若上游模型方向变化，改这一个常量即可。
+     */
+    private const val INVERT_DEPTH = true
 
     /**
      * 可选档位（推理短边，像素）。**必须与 `MaskPrefs.SPATIAL_SHORT_CHOICES` 一致**。
      *
-     * 下限 768：518 那档发丝会断线、低于训练尺寸 518 更没意义；
-     * 上限 1024：像素量约 180 万，真机 ~9.3s，**再高一档就破 10 秒**（1152 ≈ 11.8s）。
+     * 下限 768：518 那档发丝会断线；上限 1024。旧 DA2 实测数字已随换代作废，
+     * DA3 在 120 秒预算（2026-11 定案）下三档都放得下，具体耗时以真机为准。
      */
     val SHORT_SIDES = intArrayOf(768, 896, 1024)
 
@@ -92,6 +118,9 @@ internal object SpatialDepth {
     private val sessionLock = Any()
     private var session: OrtSession? = null
 
+    /** 当前会话对应的模型 key（切模型时先 close 旧会话，释放 123MB native 权重）。 */
+    private var sessionModel: String? = null
+
     /** 上一次建会话用的后端（仅诊断：每次生成都会打印，别再靠"首次创建"那行日志）。 */
     private var sessionNnapi = false
     private var sessionIntra = 0
@@ -103,15 +132,26 @@ internal object SpatialDepth {
     fun cacheKey(ctx: Context, uri: Uri): String = sha16(ctx, uri)
 
     /**
-     * 该图是否已有深度缓存：有则返回缓存键，没有返回 null。
+     * 该图是否已有**与当前参数匹配**的深度缓存：有则返回缓存键，没有返回 null。
+     *
+     * 命中条件 = `depth.png`/`meta.json` 存在 **且** `meta.model` 以当前模型文件名开头
+     * **且** `meta.shortSide` 等于目标档位 —— 换模型、换档位、DA2 旧缓存都会走重算。
      *
      * ⚠️ 会**完整读一遍图片算 sha256**（几十到几百毫秒），调用方放 IO 线程。
      */
-    fun hasCache(ctx: Context, uri: Uri): String? {
+    fun hasCache(ctx: Context, uri: Uri, shortSide: Int, model: String): String? {
         val key = sha16(ctx, uri)
         val dir = File(cacheRoot(ctx), key)
-        return if (File(dir, "depth.png").isFile && File(dir, "meta.json").isFile) key else null
+        if (!File(dir, "depth.png").isFile || !File(dir, "meta.json").isFile) return null
+        return if (metaMatches(File(dir, "meta.json"), model, shortSide)) key else null
     }
+
+    /** meta 是否与本次请求的模型/档位一致（读失败一律视为不命中 → 重算）。 */
+    private fun metaMatches(metaFile: File, model: String, shortSide: Int): Boolean = runCatching {
+        val meta = JSONObject(metaFile.readText())
+        val fileName = MODEL_NAMES[model] ?: return false
+        meta.optString("model").startsWith(fileName) && meta.optInt("shortSide") == shortSide
+    }.getOrDefault(false)
 
     /** 缓存目录里的原图文件（可能不存在）。 */
     fun sourceFile(depthDir: File): File = File(depthDir, SOURCE_NAME)
@@ -195,21 +235,34 @@ internal object SpatialDepth {
      *
      * @param shortSide 推理短边（取 [SHORT_SIDES] 里的一档）。**深度图的短边就是这个值**
      *   （对齐到 14 的倍数，例如 768 → 756），**不再统一放大到长边 1920**。
+     * @param model 模型 key（[MODEL_ASSETS] 的键，非法值回落 `base`）。
      * @param force 为 true 时**忽略已有缓存**、重算并覆盖（UI 的「10 秒内再点一次」走这条）。
      *
      * 任何失败都抛异常 —— 上层统一按「处理失败」处理，不做降级。
      */
-    fun generate(ctx: Context, uri: Uri, shortSide: Int = 768, force: Boolean = false): Result {
+    fun generate(
+        ctx: Context,
+        uri: Uri,
+        shortSide: Int = 768,
+        model: String = "base",
+        force: Boolean = false,
+    ): Result {
         val target = shortSide.takeIf { it in SHORT_SIDES } ?: 768
-        Log.i(TAG, "generate 开始：uri=$uri 短边=$target force=$force  mem=${memStat()}")
+        val modelKey = model.takeIf { it in MODEL_ASSETS } ?: "base"
+        val fileName = MODEL_NAMES.getValue(modelKey)
+        Log.i(
+            TAG,
+            "generate 开始：uri=$uri 短边=$target 模型=$fileName force=$force  mem=${memStat()}",
+        )
         val key = sha16(ctx, uri)
         val dir = File(cacheRoot(ctx), key)
         val depthFile = File(dir, "depth.png")
         val metaFile = File(dir, "meta.json")
         // 原图副本：缓存命中也补写一次（旧缓存只有 preview.webp，用户要求换成原图）
         ensureSource(ctx, uri, dir)
-        if (!force && depthFile.isFile && metaFile.isFile) {
-            Log.i(TAG, "缓存命中 $key")
+        // 命中必须模型+档位都对（换模型/换档位/DA2 旧缓存 → 自动重算）
+        if (!force && depthFile.isFile && metaFile.isFile && metaMatches(metaFile, modelKey, target)) {
+            Log.i(TAG, "缓存命中 $key（$fileName @$target）")
             return Result(dir, 0L, true)
         }
 
@@ -251,27 +304,47 @@ internal object SpatialDepth {
 
         // 四、推理
         //
-        // ⚠️ `[N, C, H, W]` —— **第 3 维是 H、第 4 维是 W**，而 `iw` 是宽、`ih` 是高，
-        // 曾经这里写成 `[1, 3, iw, ih]`（宽高颠倒），数据按 `width=iw` 行优先排布却被当成
-        // 另一个宽高去解释 ⇒ 像素错位重排，深度图整幅糊掉（2026-10-22 用户实拍发现）。
+        // ⚠️ DA3 是**多视图导出**：`pixel_values` 是 `[N, S, C, H, W]`（batch × 视图数 × 通道），
+        // 单图 = S=1。**第 4 维是 H、第 5 维是 W**，而 `iw` 是宽、`ih` 是高；
+        // 曾经 DA2 时代这里写成 `[1, 3, iw, ih]`（宽高颠倒）就整幅糊掉过（2026-10-22）。
         val env = OrtEnvironment.getEnvironment()
-        val sess = ensureSession(ctx)
+        val sess = ensureSession(ctx, modelKey)
         // **每次生成都打**：不要靠「首次建会话」那一行（进程复用时会话已存在就直接跳过了）
         Log.i(
             TAG,
-            "session: nnapi=$sessionNnapi intra=$sessionIntra cores=${Runtime.getRuntime().availableProcessors()}",
+            "session: model=$fileName nnapi=$sessionNnapi intra=$sessionIntra " +
+                "cores=${Runtime.getRuntime().availableProcessors()}",
         )
+        // DA3 只有一个输入 `pixel_values`（`[N,S,3,H,W]` 多视图，单图 S=1）；
+        // 输出有 `predicted_depth` + `confidence` + `extrinsics`/`intrinsics`（后两者忽略），
+        // **必须按名取**（输出顺序不保证），形状见下面的 rank 分支。
+        check(sess.inputNames.size == 1) { "期望单输入，实际：${sess.inputNames}" }
         val inputName = sess.inputNames.first()
         val depth: FloatArray
         var ow: Int
         var oh: Int
-        OnnxTensor.createTensor(env, FloatBuffer.wrap(chw), longArrayOf(1, 3, ih.toLong(), iw.toLong()))
-            .use { input ->
+        OnnxTensor.createTensor(
+            env,
+            FloatBuffer.wrap(chw),
+            longArrayOf(1, 1, 3, ih.toLong(), iw.toLong()),
+        ).use { input ->
                 sess.run(mapOf(inputName to input)).use { out ->
-                    val tensor = out[0] as OnnxTensor
+                    // ORT Java 的 get(String) 返回 Optional<OnnxTensor>
+                    val tensor = out.get("predicted_depth").orElse(null)
+                        ?: (out[0] as OnnxTensor)
                     val info = tensor.info as TensorInfo
-                    oh = info.shape[1].toInt()
-                    ow = info.shape[2].toInt()
+                    // DA3 导出是 rank-4 `[1,1,H,W]`；旧 DA2 是 rank-3 `[1,H,W]`。两种都认。
+                    when (info.shape.size) {
+                        4 -> {
+                            oh = info.shape[2].toInt()
+                            ow = info.shape[3].toInt()
+                        }
+                        3 -> {
+                            oh = info.shape[1].toInt()
+                            ow = info.shape[2].toInt()
+                        }
+                        else -> error("推理输出维度异常：${info.shape.contentToString()}")
+                    }
                     check(ow > 0 && oh > 0) { "推理输出尺寸异常：${ow}×$oh" }
                     Log.i(TAG, "推理输出 ${ow}×$oh（输入 ${iw}×$ih）")
                     val fb = tensor.floatBuffer
@@ -291,7 +364,10 @@ internal object SpatialDepth {
         // 灰度复用 px（NCHW 已经转完，那块内存不再需要）
         val gray = if (ow * oh == buf.n) buf.px else IntArray(ow * oh)
         for (i in gray.indices) {
-            val g = ((depth[i] - lo) / range * 255f).roundToInt().coerceIn(0, 255)
+            // INVERT_DEPTH：DA3 的 predicted_depth 是距离（越大越远），翻转成「越亮=越近」
+            val norm = (depth[i] - lo) / range
+            val near = if (INVERT_DEPTH) 1f - norm else norm
+            val g = (near * 255f).roundToInt().coerceIn(0, 255)
             gray[i] = (0xFF shl 24) or (g shl 16) or (g shl 8) or g
         }
         val bmp = Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888)
@@ -317,7 +393,7 @@ internal object SpatialDepth {
             .put("costMs", costMs)
             .put("depthMin", lo.toDouble())
             .put("depthMax", hi.toDouble())
-            .put("model", "dav2_small_int8.onnx (full int8, ort-android 1.31.0)")
+            .put("model", "$fileName (int8, ort-android 1.31.0)")
             .put("createdAt", System.currentTimeMillis())
         metaFile.writeText(meta.toString())
 
@@ -393,10 +469,23 @@ internal object SpatialDepth {
         return "java=${javaUsed}/${javaMax}MB native=${nativeUsed}/${nativeSize}MB pool=${poolMb}MB"
     }
 
-    /** 懒加载 session：模型加载 ~1s，重复生成时复用。 */
-    private fun ensureSession(ctx: Context): OrtSession = synchronized(sessionLock) {
+    /**
+     * 懒加载 session：模型加载 ~1s，重复生成时复用。
+     *
+     * [model] 与当前会话不一致时**先 close 旧会话再建新的** —— DA3-Base 权重 123MB，
+     * 常驻两份会把低内存设备打出局。
+     */
+    private fun ensureSession(ctx: Context, model: String): OrtSession = synchronized(sessionLock) {
+        if (session != null && sessionModel != model) {
+            runCatching { session?.close() }
+                .onFailure { Log.w(TAG, "旧会话关闭失败：${it.message}") }
+            session = null
+            sessionModel = null
+            Log.i(TAG, "模型切换，旧会话已释放（新模型=$model）")
+        }
         session ?: run {
-            val model = ensureModelFile(ctx)
+            val fileName = MODEL_NAMES.getValue(model)
+            val modelFile = ensureModelFile(ctx, MODEL_ASSETS.getValue(model), fileName)
             val env = OrtEnvironment.getEnvironment()
             val cores = Runtime.getRuntime().availableProcessors()
             // 8 Gen 3 是 1+3+4。开满 8 线程时调度器会把一部分线程丢到小核，抖动大、总体更慢；
@@ -409,9 +498,9 @@ internal object SpatialDepth {
                     setIntraOpNumThreads(intra)
                     setInterOpNumThreads(1)
                     setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-                    // **关掉 CPU Arena**（2026-10-26 实测定位）。
+                    // **关掉 CPU Arena**（2026-10-26 实测定位，DA3 换代后同样保留）。
                     //
-                    // DA V2 的 DPT 解码器最后几层在**全分辨率**上融合特征：
+                    // DA 系的 DPT 解码器最后几层在**全分辨率**上融合特征：
                     //   1022×1554 × 256ch × 4B ≈ 1.6GB，× 128ch ≈ 0.8GB
                     // 实测 `dumpsys meminfo` 的 Native Heap 从 32MB 涨到 **2016MB**（8 秒推理），
                     // 而 ORT 的 CPU Arena **在推理结束后不把内存还给系统**（session 常驻，
@@ -421,7 +510,7 @@ internal object SpatialDepth {
                     // 代价：每次推理多几次 malloc（实测影响很小，见日志耗时）。
                     setCPUArenaAllocator(false)
                 }
-                return env.createSession(model.absolutePath, opts)
+                return env.createSession(modelFile.absolutePath, opts)
             }
 
             // NNAPI 已关闭（2026-10-23 实测：nnapi=true 但耗时没有收益，白绕一层）
@@ -431,10 +520,12 @@ internal object SpatialDepth {
             sessionIntra = intraCpu
             sess.also {
                 session = it
+                sessionModel = model
                 Log.i(
                     TAG,
-                    "session 就绪：nnapi=$nnapi intra=${if (nnapi) 4 else intraCpu}/$cores "
-                        + "opt=${OrtSession.SessionOptions.OptLevel.ALL_OPT}",
+                    "session 就绪：model=$fileName nnapi=$nnapi " +
+                        "intra=${if (nnapi) 4 else intraCpu}/$cores " +
+                        "opt=${OrtSession.SessionOptions.OptLevel.ALL_OPT}",
                 )
             }
         }
@@ -444,16 +535,17 @@ internal object SpatialDepth {
      * 把模型流式拷到 `files/models/`（**不要 readBytes**，会双份内存）。
      *
      * 用 `<name>.ok` 记录上次拷贝的字节数：长度对不上就重拷，避免模型换版本后读到旧文件。
+     * （内容完整性由构建期的 SHA-256 校验保证，这里只管落盘。）
      */
-    private fun ensureModelFile(ctx: Context): File {
+    private fun ensureModelFile(ctx: Context, assetPath: String, fileName: String): File {
         val dir = File(ctx.filesDir, "models").apply { mkdirs() }
-        val dst = File(dir, MODEL_NAME)
-        val okMark = File(dir, "$MODEL_NAME.ok")
+        val dst = File(dir, fileName)
+        val okMark = File(dir, "$fileName.ok")
         if (dst.isFile && okMark.isFile && okMark.readText().trim().toLongOrNull() == dst.length()) {
             return dst
         }
-        val tmp = File(dir, "$MODEL_NAME.tmp")
-        ctx.assets.open(MODEL_ASSET).use { ins ->
+        val tmp = File(dir, "$fileName.tmp")
+        ctx.assets.open(assetPath).use { ins ->
             FileOutputStream(tmp).use { outs -> ins.copyTo(outs) }
         }
         if (dst.exists()) dst.delete()

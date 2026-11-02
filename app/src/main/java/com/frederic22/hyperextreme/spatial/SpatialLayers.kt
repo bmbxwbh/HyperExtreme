@@ -133,8 +133,11 @@ internal object SpatialLayers {
      *      等价于「按到轮廓距离渐变」——不如直接做那个。
      * 65 = **回退 64**。注意版本号必须**往前走**：`hasLayers()` 判的是 `>= FORMAT_VERSION`，
      *      退回 63 会让 v1.5.29 生成的 64 缓存被放行。
+     * 66 = **深度源换 DA3**（Small/Base 二选一，2026-11-02）：直方图分布与 DA2 不同，
+     *      谷底/σ/极差定标阈值（VALLEY_MAX、DEPTH_STD_REF、DEPTH_RANGE_REF）**暂不动**，
+     *      待真机验证主体分离与视差幅度后再调；强制重算全部层图。
      */
-    private const val FORMAT_VERSION = 65
+    private const val FORMAT_VERSION = 66
 
     /**
      * **枢轴处的残余位移** = 位移场的最小系数。

@@ -49,7 +49,7 @@ class MaskPrefs(context: Context) {
      *
      * **只影响 `files/spatial/` 的深度图生成**，与视差链没有任何关系。
      * 合法档位见 `spatial/SpatialDepth.SHORT_SIDES`（768 / 896 / 1024）——
-     * 数值越大深度图越细，但推理越慢（768 ≈ 5.3s，1024 ≈ 9.3s，10 秒是硬上限）。
+     * 数值越大深度图越细，但推理越慢（DA3-Base@768 预计 20~25s，单张 120 秒预算，2026-11 定案）。
      * 读到的值不在合法档位里时按默认值处理，避免旧数据把界面搞崩。
      */
     val spatialShortSide: Int
@@ -58,6 +58,20 @@ class MaskPrefs(context: Context) {
 
     fun setSpatialShortSide(value: Int) {
         prefs.edit().putInt(KEY_SPATIAL_SHORT_SIDE, value).commit()
+    }
+
+    /**
+     * 空间壁纸「推理模型」（`base` / `small`），默认 [SPATIAL_MODEL_DEFAULT]。
+     *
+     * 合法取值见 `spatial/SpatialDepth.MODEL_ASSETS`（`base` = DA3-Base 质量优先，
+     * `small` = DA3-Small 速度优先）。换模型后旧深度缓存按 `meta.model` 自动失效重算。
+     */
+    val spatialModel: String
+        get() = prefs.getString(KEY_SPATIAL_MODEL, SPATIAL_MODEL_DEFAULT)
+            ?.takeIf { it in SPATIAL_MODEL_CHOICES } ?: SPATIAL_MODEL_DEFAULT
+
+    fun setSpatialModel(value: String) {
+        prefs.edit().putString(KEY_SPATIAL_MODEL, value).commit()
     }
 
     /**
@@ -769,6 +783,8 @@ class MaskPrefs(context: Context) {
         const val KEY_DEPTH_OCCLUSION = "depth_occlusion_removed"
         /** 空间壁纸的推理短边（像素档位）。 */
         const val KEY_SPATIAL_SHORT_SIDE = "spatial_short_side"
+        /** 空间壁纸的推理模型 key（"base"/"small"，见 `SpatialDepth.MODEL_ASSETS`）。 */
+        const val KEY_SPATIAL_MODEL = "spatial_model"
         /** 空间壁纸是否生效（SystemUI 侧轮询）。 */
         const val KEY_SPATIAL_ACTIVE = "spatial_active"
         /** 当前生效的图层缓存键（图片 sha256 前 16 位）。 */
@@ -827,6 +843,10 @@ class MaskPrefs(context: Context) {
         const val SPATIAL_SHORT_DEFAULT = 768
         /** 合法档位白名单 —— 读到意外的值就回默认，避免下拉栏 index 越界。 */
         private val SPATIAL_SHORT_CHOICES = intArrayOf(768, 896, 1024)
+        /** 空间壁纸推理模型默认值（"base" = DA3-Base，质量优先，与 UI 下拉顺序一致）。 */
+        const val SPATIAL_MODEL_DEFAULT = "base"
+        /** 合法模型白名单 —— 读到意外的值就回默认（与 `SpatialDepth.MODEL_ASSETS` 的键一致）。 */
+        private val SPATIAL_MODEL_CHOICES = listOf("base", "small")
         /** 用户是否确认过「替换时屏幕会自动灭亮一次」（确认过就不再提示）。 */
         /** 「替换后自动灭亮屏一次」（替换行为里的开关，默认关）。 */
         const val KEY_AUTO_SCREEN_FLASH = "auto_screen_flash"

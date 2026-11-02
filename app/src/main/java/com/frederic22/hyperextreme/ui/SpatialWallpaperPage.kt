@@ -97,7 +97,8 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
     var picked by remember { mutableStateOf<Uri?>(null) }
     var preview by remember { mutableStateOf<Bitmap?>(null) }
     var showClearConfirm by remember { mutableStateOf(false) }
-    // 深度推理进行中：按钮禁用，防连点重复跑（一次 7~10s，重复跑会同时占两份内存）。
+    // 深度推理进行中：按钮禁用，防连点重复跑（DA3-Base 一张可达数十秒，120s 预算；
+    // 重复跑会同时占两份内存）。
     var busy by remember { mutableStateOf(false) }
     // 「这张图有没有缓存」只是读几个文件，几百毫秒内就回来。**绝不能翻 busy** ——
     // busy 会同时把「更换图片 / 生成深度缓存」打灰，视觉上就是闪一下（2026-10-29 用户反馈）。
@@ -124,6 +125,9 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
         )
     }
     var shortSide by remember { mutableStateOf(prefs.spatialShortSide) }
+    // 「推理模型」：DA3-Base（默认，质量优先）/ DA3-Small（速度优先），存在 MaskPrefs 里。
+    // 切换只影响**下一次**生成；旧深度缓存靠 meta.model 校验自动失效重算。
+    var modelChoice by remember { mutableStateOf(prefs.spatialModel) }
     // 「空间壁纸生效范围」：0 锁屏（默认）/ 1 桌面 / 2 全局。**不影响层图生成**，只决定渲染器挂哪条 leash。
     var scopeChoice by remember { mutableStateOf(prefs.spatialScope) }
     // 「启用空间壁纸锁屏景深」（2026-10-29）：默认关；关时渲染逻辑与加它之前完全一致。
@@ -282,7 +286,7 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                 // 同时常驻要 168MB，分层再要一块就撞 256MB 堆上限（2026-10-31）。
                 runCatching {
                     try {
-                        SpatialDepth.generate(ctx, uri, shortSide, force)
+                        SpatialDepth.generate(ctx, uri, shortSide, modelChoice, force)
                     } finally {
                         SpatialDepth.dropPool()
                     }
@@ -323,6 +327,7 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                         buildList {
                             add("缓存目录：${depth.dir.absolutePath}")
                             add("推理短边：$shortSide")
+                            add("推理模型：$modelChoice")
                             add(if (depth.hitCache) "深度命中缓存" else "深度耗时 ${depth.costMs} ms")
                             if (layer != null) {
                                 add(if (layer.hit) "层图命中" else "8 层耗时 ${layer.costMs} ms → ${layer.dir.absolutePath}")
@@ -504,7 +509,9 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                                 scope.launch {
                                     checking = true
                                     val key = withContext(Dispatchers.IO) {
-                                        runCatching { SpatialDepth.hasCache(ctx, uri) }.getOrNull()
+                                        runCatching {
+                                            SpatialDepth.hasCache(ctx, uri, shortSide, modelChoice)
+                                        }.getOrNull()
                                     }
                                     checking = false
                                     val now = SystemClock.elapsedRealtime()
@@ -686,6 +693,21 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                     val value = SpatialDepth.SHORT_SIDES[index]
                     shortSide = value
                     prefs.setSpatialShortSide(value)
+                },
+            )
+            // 「推理模型」（2026-11-02 DA3 换代，用户要求加入模型选择）：
+            // Base = DA3-Base 0.12B（默认，质量优先，768 下预计 20~25s）；
+            // Small = DA3-Small（约 5s，与换代前体验相当）。
+            // **不锁 busy**：只影响下一次生成；旧深度缓存靠 meta.model 校验自动失效重算。
+            DropdownRow(
+                title = "推理模型",
+                summary = "Base 更准更慢，Small 更快",
+                options = listOf("DA3-Base（默认）", "DA3-Small"),
+                selectedIndex = if (modelChoice == "small") 1 else 0,
+                onSelect = { index ->
+                    val value = if (index == 1) "small" else "base"
+                    modelChoice = value
+                    prefs.setSpatialModel(value)
                 },
             )
             // 「空间壁纸生效范围」（2026-10-28 用户要求，**排在「清除所有深度缓存」上面**）：

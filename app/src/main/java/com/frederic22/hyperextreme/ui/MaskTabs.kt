@@ -1286,7 +1286,8 @@ private data class OpenSourceEntry(
  *
  * 两大类：
  * - **依赖与权重**：miuix / Kyant 两个库 / libxposed API / AndroidX / Compose Multiplatform /
- *   ONNX Runtime（深度推理的执行引擎）/ Depth Anything V2 **Small**（`assets/models/dav2_small_int8.onnx`）；
+ *   ONNX Runtime（深度推理的执行引擎）/ Depth Anything 3 **Small + Base**
+ *   （`assets/models/da3_small_int8.onnx` + 构建期下载的 `da3_base_int8.onnx`）；
  * - **移植进工程的代码**：HyperChanger 的悬浮底栏（`ui/nav/`）、PatchMatch 的 C 移植
  *   （`cpp/patchmatch/`，编成 `libspatial_fill.so`）、Material Icons 的两个图标（`ui/icons/`）。
  *
@@ -1294,7 +1295,10 @@ private data class OpenSourceEntry(
  * - `HyperChanger v1.1.3` 是我们实际引用的 tag（commit `a01dc46`，2026-09-18），该版本是 Apache-2.0；
  *   上游后来把协议换成了 **AGPL-3.0-or-later**。Apache-2.0 授权不可撤销，我们那份永久有效，
  *   但版本号必须留着 —— 它划清"我们用的是换协议之前的那一版"。
- * - `Depth Anything V2 Small` 同理：只有 Small/Base/Large 权重是 Apache-2.0，**Giant 是 CC-BY-NC-4.0**。
+ * - 深度模型的协议（2026-11-02 DA3 换代时查证，**修正了旧注释的错误**）：
+ *   Depth Anything 2 只有 **Small** 是 Apache-2.0（Base/Large 实为 CC-BY-NC-4.0）；
+ *   Depth Anything 3 只有 **Small/Base** 是 Apache-2.0（Large/Giant/Nested 是 CC-BY-NC-4.0）。
+ *   我们只用 DA3 的 Small/Base 两档，均为 Apache-2.0。
  */
 private val OpenSourceLicenses = listOf(
     OpenSourceEntry(
@@ -1323,12 +1327,19 @@ private val OpenSourceLicenses = listOf(
         "Compose Multiplatform", "JetBrains", "Apache-2.0",
         "https://github.com/JetBrains/compose-multiplatform",
     ),
-    // 空间壁纸的深度推理模型（`assets/models/dav2_small_int8.onnx`，ViT-S 全量动态量化）。
-    // ⚠️ 名称必须带 **Small**：只有 **Small/Base/Large** 权重是 Apache-2.0；**Giant** 那档是
-    //    CC-BY-NC-4.0，换模型前先看协议（见《07-坑点台账》§7.13 旁边那条）。
+    // 空间壁纸的深度推理模型（2026-11-02 从 DA2 换代为 DA3 双模型）：
+    // * `assets/models/da3_small_int8.onnx`（29MB，HF `en970/depth-anything-v3-small-onnx`，q8 动态量化）；
+    // * `assets/models/da3_base_int8.onnx`（123MB，HF `jlampel/depth-anything-3-base-onnx-int8`，
+    //   MatMulNBits int8，构建时由 Gradle 下载 + SHA-256 校验，不入库）。
+    // 论文：Depth Anything 3，arXiv:2511.10647。**只有 Small/Base 是 Apache-2.0**
+    // （Large/Giant/Nested 是 CC-BY-NC-4.0，我们不用 —— 换模型前先看协议）。
     OpenSourceEntry(
-        "Depth Anything V2 Small", "DepthAnything", "Apache-2.0",
-        "https://github.com/DepthAnything/Depth-Anything-V2",
+        "Depth Anything 3 Small", "ByteDance-Seed", "Apache-2.0",
+        "https://github.com/ByteDance-Seed/Depth-Anything-3",
+    ),
+    OpenSourceEntry(
+        "Depth Anything 3 Base", "ByteDance-Seed", "Apache-2.0",
+        "https://github.com/ByteDance-Seed/Depth-Anything-3",
     ),
     // 深度推理的执行引擎（`implementation(libs.onnxruntime.android)`，1.31.0）。MIT。
     OpenSourceEntry(
