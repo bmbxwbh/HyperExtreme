@@ -136,8 +136,14 @@ internal object SpatialLayers {
      * 66 = **深度源换 DA3**（Small/Base 二选一，2026-11-02）：直方图分布与 DA2 不同，
      *      谷底/σ/极差定标阈值（VALLEY_MAX、DEPTH_STD_REF、DEPTH_RANGE_REF）**暂不动**，
      *      待真机验证主体分离与视差幅度后再调；强制重算全部层图。
+     * 67 = **DA3 视差幅度重定标**（66 的"待真机验证"收口）：实测 DA3 的两个定标判据
+     *      全部失真 —— 极差 0.78 vs REF 5.0 直接触底 0.3、σ 0.19~0.25 vs REF 0.32
+     *      再压一节，合成幅度只有 DA2 时代的 **31%**（用户反馈「效果没 DA2 好」，
+     *      DA2 参照实测 kBg 均值 0.56 / kFg 0.21、σ 0.307）。改为按 meta.model 分流：
+     *      DA3 用 DEPTH_STD_REF_DA3=0.25 且**跳过极差判据**（距离制 range 是场景尺度量）；
+     *      DA2 路径与阈值原样保留。VALLEY_MAX 未动（DA3 主体分离实测 hasBody 正常）。
      */
-    private const val FORMAT_VERSION = 66
+    private const val FORMAT_VERSION = 67
 
     /**
      * **枢轴处的残余位移** = 位移场的最小系数。
@@ -400,6 +406,21 @@ internal object SpatialLayers {
      * ⇒ 误判成立体感强。所以两个判据取**小值**，任何一个说"平"就压下去。
      */
     private const val DEPTH_RANGE_REF = 5.0f
+
+    /**
+     * **DA3 专用 σ 参考值**（2026-11-02 换代实测，方法论同 [DEPTH_STD_REF]）。
+     *
+     * DA3 输出的是「距离」而非视差：min-max 后分布整体比 DA2 平，
+     * 实测四张 σ = 0.195（猫特写）/ 0.219（人像）/ 0.220（风景-small）/ 0.255（风景-base）。
+     * 取 0.25 为参考（实测最大值 ⇒ 最立体的 = 1.0、其余 0.78~0.88），
+     * 手感与 DA2（REF 0.32 ⇒ 0.75~1.0）对齐。
+     *
+     * ⚠️ 同时 DA3 **跳过极差判据**：它的 `depthMax−depthMin` 随场景尺度乱变
+     * （猫特写 0.78、风景 2.9，而 REF 5.0 是按 DA2 视差标定的 ⇒ 一用就触底 0.3，
+     * 实测把视差压到 DA2 时代的 31%，用户反馈「效果没 DA2 好」）。
+     * 判据按 `meta.model` 以 `da3_` 开头分流（见 [generate] 里 depthScale 的计算）。
+     */
+    private const val DEPTH_STD_REF_DA3 = 0.25f
 
     /**
      * **层间形变增益**：乘在 `(1 − K_MIN)` 上，只压「不同深度之间的位移差」。
@@ -978,17 +999,22 @@ internal object SpatialLayers {
             dSq += v.toDouble() * v
         }
         val depthStd = stdOf(dSum, dSq, n)
-        val scaleByStd = (depthStd / DEPTH_STD_REF).coerceIn(0.3f, 1f)
-        // 原始范围（归一化之前的值）—— 这才是「相对深度」的直接度量。
-        // 读不到（老缓存没有 meta）就退回只用 σ。
-        val depthRange = runCatching {
-            val j = JSONObject(File(depthDir, "meta.json").readText())
-            (j.optDouble("depthMax", 0.0) - j.optDouble("depthMin", 0.0)).toFloat()
-        }.getOrDefault(0f)
-        val scaleByRange = if (depthRange > 0.1f) {
-            (depthRange / DEPTH_RANGE_REF).coerceIn(0.3f, 1f)
-        } else {
+        // meta 一次读出：模型名（分流 DA2/DA3 定标）+ 原始极差。
+        // 老缓存没有 meta ⇒ model=""、range=0 ⇒ 走 DA2 路径的 σ-only，与旧行为一致。
+        val meta = runCatching { JSONObject(File(depthDir, "meta.json").readText()) }.getOrNull()
+        val isDa3 = (meta?.optString("model") ?: "").startsWith("da3_")
+        val scaleByStd = (depthStd / (if (isDa3) DEPTH_STD_REF_DA3 else DEPTH_STD_REF))
+            .coerceIn(0.3f, 1f)
+        // 原始范围（归一化之前的值）—— DA2 视差下才是「相对深度」的直接度量。
+        // DA3 跳过（=1f）：距离制输出的 range 是场景尺度量，REF 5.0 按 DA2 标定的，
+        // DA3 一用就触底 0.3（见 DEPTH_STD_REF_DA3 注释，2026-11-02 实测对比）。
+        val depthRange = (meta?.let {
+            (it.optDouble("depthMax", 0.0) - it.optDouble("depthMin", 0.0)).toFloat()
+        }) ?: 0f
+        val scaleByRange = if (isDa3 || depthRange <= 0.1f) {
             1f
+        } else {
+            (depthRange / DEPTH_RANGE_REF).coerceIn(0.3f, 1f)
         }
         // 取小：σ 会被归一化的噪声骗高，range 会被画面角落的极值骗高 —— 谁保守听谁的
         val depthScale = min(scaleByStd, scaleByRange)
