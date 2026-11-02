@@ -1,7 +1,13 @@
 // `java` 在这个脚本里被 Gradle 的 java 插件扩展占用，用别名 import 绕开，
 // 否则 `java.util.Properties` 会被解析成 `JavaPluginExtension.util`。
+// ⚠️ 同理，脚本体内**不能写 `java.security.*` / `java.net.*` / `java.io.*` 这种
+// 全限定名**（首段 `java` 同样被扩展遮蔽 ⇒ Unresolved reference 'security'/'net'/'io'，
+// 2026-11-02 CI 实测），一律走顶部 import + 短名。
 import java.util.Properties as JavaProperties
 import java.io.File
+import java.io.FileOutputStream
+import java.net.URI
+import java.security.MessageDigest
 
 plugins {
     alias(libs.plugins.android.application)
@@ -152,7 +158,7 @@ val da3BaseUrls = listOf(
 val da3BaseSha256 = "86dd3200ed2506fe4d394b6526691f5c4591d88f51d3f42520aaee0b85387aaf"
 
 fun sha256Hex(f: File): String {
-    val md = java.security.MessageDigest.getInstance("SHA-256")
+    val md = MessageDigest.getInstance("SHA-256")
     f.inputStream().use { ins ->
         val buf = ByteArray(1 shl 16)
         while (true) {
@@ -179,9 +185,9 @@ val fetchDa3BaseModel = tasks.register("fetchDa3BaseModel") {
                 logger.lifecycle("fetchDa3BaseModel：下载 $url")
                 val tmp = File(da3BaseModelFile.parentFile, "${da3BaseModelFile.name}.tmp")
                 if (tmp.exists()) tmp.delete()
-                val md = java.security.MessageDigest.getInstance("SHA-256")
-                java.net.URI(url).toURL().openStream().use { ins ->
-                    java.io.FileOutputStream(tmp).use { outs ->
+                val md = MessageDigest.getInstance("SHA-256")
+                URI(url).toURL().openStream().use { ins ->
+                    FileOutputStream(tmp).use { outs ->
                         val buf = ByteArray(1 shl 16)
                         while (true) {
                             val r = ins.read(buf)
