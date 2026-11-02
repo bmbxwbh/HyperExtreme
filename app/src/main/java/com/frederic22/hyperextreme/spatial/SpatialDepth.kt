@@ -18,6 +18,7 @@ import java.nio.FloatBuffer
 import java.security.MessageDigest
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 /**
@@ -382,6 +383,8 @@ internal object SpatialDepth {
             val g = (near * 255f).roundToInt().coerceIn(0, 255)
             gray[i] = (0xFF shl 24) or (g shl 16) or (g shl 8) or g
         }
+        // 五.5 双峰整形 —— 必须在写盘前做，导入的缓存包（PC 导出）也走同一套参数。
+        shapeBimodal(gray)
         val bmp = Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888)
         bmp.setPixels(gray, 0, ow, 0, 0, ow, oh)
 
@@ -566,6 +569,73 @@ internal object SpatialDepth {
         Log.i(TAG, "模型已拷到 ${dst.absolutePath}（${dst.length()} 字节）")
         return dst
     }
+
+    /**
+     * **双峰整形**（2026-11-02，与 `tools/export_spatial_cache.mjs` 同参数）。
+     *
+     * 为什么：DA3 输出的是「距离」，远景被拉开成连续渐变 —— 直接喂给分层：
+     * * 背景散：σ 0.098（DA2 只有 0.044）⇒ 背景各处动得不一样，画面"乱滑"；
+     * * 主体糊：主体轮廓带深度梯度 1.5（DA2 是 3.6）⇒ mask 站在糊过渡带上、边缘抖；
+     * * 主体内部按米级真实差异各动各的（脸/胸/爪）⇒ **面部相对身体抖动**。
+     *
+     * 分段单调曲线重塑成 DA2 风格双峰：背压暗带（γ=3）、过渡带收窄拉陡（边缘锐化）、
+     * 主体压进亮台（内部跨度降 25%+）。**切点用 Otsu（类间方差最大化）**找
+     * 「亮主体 vs 其余」的谷 —— 固定百分位会在背景自身双峰（暗塔+中灰天空）内部
+     * 下刀、把天空推进主体亮台（2026-11-02 实测踩坑，见 tools 同名注释）。
+     * 实测（猫/风景）：背 mean 0.05、σ 0.04（≈DA2 0.044）、对比 0.68/0.72（>DA2 0.60）、
+     * 天空带压暗 0.07、近景带 0.79、整体 σ ≈ DA2 定标点 ⇒ 分层定标自动回正。
+     *
+     * 单调变换 ⇒ 深度排序不变，无伪影。退化分布（Otsu 谷不存在）直接跳过。
+     */
+    private fun shapeBimodal(gray: IntArray) {
+        val n = gray.size
+        val hist = IntArray(256)
+        for (i in 0 until n) hist[(gray[i] shr 16) and 0xFF]++
+
+        // Otsu：最大化类间方差 ⇒ 「亮主体 vs 其余」的最优切点（0..255）
+        var sum = 0.0
+        for (v in 0..255) sum += v.toDouble() * hist[v]
+        var sumB = 0.0
+        var wB = 0
+        var best = -1.0
+        var tOtsu = 128
+        for (v in 0..255) {
+            wB += hist[v]
+            if (wB == 0) continue
+            val wF = n - wB
+            if (wF == 0) break
+            sumB += v.toDouble() * hist[v]
+            val mB = sumB / wB
+            val mF = (sum - sumB) / wF
+            val score = wB.toDouble() * wF * (mB - mF) * (mB - mF)
+            if (score > best) {
+                best = score
+                tOtsu = v
+            }
+        }
+
+        val a = (tOtsu - SHAPE_RAMP).coerceAtLeast(8)
+        val b = (tOtsu + SHAPE_RAMP).coerceAtMost(247)
+        if (b <= a) return
+        for (i in 0 until n) {
+            val v = (gray[i] shr 16) and 0xFF
+            val s = when {
+                v <= a -> (v.toDouble() / a).pow(SHAPE_GAMMA_BG) * SHAPE_BG
+                v <= b -> SHAPE_BG + (SHAPE_MID - SHAPE_BG) * (v - a).toDouble() / (b - a)
+                else -> SHAPE_MID + (255.0 - SHAPE_MID) *
+                    ((v - b).toDouble() / (255 - b)).pow(SHAPE_GAMMA_SUBJ)
+            }
+            val g = s.roundToInt().coerceIn(0, 255)
+            gray[i] = (0xFF shl 24) or (g shl 16) or (g shl 8) or g
+        }
+    }
+
+    /** 整形锚点（0..255 灰度）；取值依据见 [shapeBimodal] 注释。 */
+    private const val SHAPE_RAMP = 13 // Otsu 谷两侧过渡带半宽 ≈ 0.05×255
+    private const val SHAPE_BG = 25.5
+    private const val SHAPE_MID = 153.0
+    private const val SHAPE_GAMMA_BG = 3.0
+    private const val SHAPE_GAMMA_SUBJ = 1.5
 
     /** 图片内容 sha256 前 16 位（16 个 hex 字符）。 */
     private fun sha16(ctx: Context, uri: Uri): String {

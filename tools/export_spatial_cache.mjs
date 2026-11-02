@@ -158,7 +158,7 @@ async function main() {
   const ow = dims.length === 4 ? dims[3] : dims[2];
   if (ow !== w || oh !== h) throw new Error(`输出尺寸 ${ow}×${oh} 与输入 ${w}×${h} 不符`);
 
-  // --- min-max 归一化 + 方向翻转（越亮 = 越近） ---
+  // --- min-max 归一化 + 方向翻转（越亮 = 越近）---
   const data = tensor.data;
   let lo = Infinity;
   let hi = -Infinity;
@@ -168,13 +168,58 @@ async function main() {
     if (v > hi) hi = v;
   }
   const range = hi - lo > 1e-6 ? hi - lo : 1;
-  const png = new PNG({ width: ow, height: oh });
-  for (let i = 0; i < ow * oh; i++) {
+  const n = ow * oh;
+  const gray = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
     const norm = (data[i] - lo) / range;
-    const g = Math.round((INVERT_DEPTH ? 1 - norm : norm) * 255);
-    png.data[i * 4] = g;
-    png.data[i * 4 + 1] = g;
-    png.data[i * 4 + 2] = g;
+    gray[i] = Math.round((INVERT_DEPTH ? 1 - norm : norm) * 255);
+  }
+
+  // --- 双峰整形（与 SpatialDepth.shapeBimodal 同参数）---
+  // DA3 输出「距离」，远景是拉开的渐变：直接分层会背景散（σ 0.098 vs DA2 0.044）、
+  // 主体糊（轮廓梯度 1.5 vs 3.6）、主体内按米级差异乱动（面部抖动的根源）。
+  // 分段单调曲线重塑成 DA2 风格双峰。**切点用 Otsu（类间方差最大化）找「亮主体 vs 其余」
+  // 的谷** —— 固定百分位会在背景自身双峰（暗塔+中灰天空）内部下刀，把天空推进主体亮台
+  // （2026-11-02 实测踩坑）。实测（猫/风景）：背 mean 0.05/σ 0.04、对比 0.68/0.72
+  // （超 DA2 的 0.60）、天空带压暗 0.07、近景带 0.79、整体 σ ≈ DA2 定标点。
+  const SHAPE_RAMP = 0.05; // 过渡带半宽（Otsu 谷两侧各 0.05）
+  const SHAPE_BG = 0.10, SHAPE_MID = 0.60, SHAPE_GAMMA_BG = 3, SHAPE_GAMMA_SUBJ = 1.5;
+  {
+    const hist = new Int32Array(256);
+    for (let i = 0; i < n; i++) hist[gray[i]]++;
+    // Otsu：最大化类间方差 ⇒ 亮主体 vs 其余的最优切点（0..255）
+    let sum = 0;
+    for (let v = 0; v < 256; v++) sum += v * hist[v];
+    let sumB = 0, wB = 0, best = -1, tOtsu = 128;
+    for (let v = 0; v < 256; v++) {
+      wB += hist[v];
+      if (!wB) continue;
+      const wF = n - wB;
+      if (!wF) break;
+      sumB += v * hist[v];
+      const mB = sumB / wB, mF = (sum - sumB) / wF;
+      const score = wB * wF * (mB - mF) * (mB - mF);
+      if (score > best) { best = score; tOtsu = v; }
+    }
+    const a = Math.max(8, tOtsu - Math.round(SHAPE_RAMP * 255));
+    const b = Math.min(247, tOtsu + Math.round(SHAPE_RAMP * 255));
+    if (b > a) {
+      for (let i = 0; i < n; i++) {
+        const v = gray[i];
+        let s;
+        if (v <= a) s = Math.pow(v / a, SHAPE_GAMMA_BG) * SHAPE_BG;
+        else if (v <= b) s = SHAPE_BG + (SHAPE_MID - SHAPE_BG) * ((v - a) / (b - a));
+        else s = SHAPE_MID + (1 - SHAPE_MID) * Math.pow((v - b) / (255 - b), SHAPE_GAMMA_SUBJ);
+        gray[i] = Math.max(0, Math.min(255, Math.round(s * 255)));
+      }
+    }
+  }
+
+  const png = new PNG({ width: ow, height: oh });
+  for (let i = 0; i < n; i++) {
+    png.data[i * 4] = gray[i];
+    png.data[i * 4 + 1] = gray[i];
+    png.data[i * 4 + 2] = gray[i];
     png.data[i * 4 + 3] = 255;
   }
 
