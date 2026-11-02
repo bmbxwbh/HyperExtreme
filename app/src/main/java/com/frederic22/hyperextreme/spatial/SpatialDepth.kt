@@ -74,8 +74,8 @@ internal object SpatialDepth {
         "small" to "models/da3_small_int8.onnx",
     )
 
-    /** 模型 key → 文件名（缓存 meta 校验、日志用）。 */
-    private val MODEL_NAMES: Map<String, String> = MODEL_ASSETS.mapValues { (_, asset) ->
+    /** 模型 key → 文件名（缓存 meta 校验、日志用）。导入校验（SpatialImport）也要用。 */
+    val MODEL_NAMES: Map<String, String> = MODEL_ASSETS.mapValues { (_, asset) ->
         asset.substringAfterLast('/')
     }
 
