@@ -330,30 +330,31 @@ internal object SpatialDepth {
             FloatBuffer.wrap(chw),
             longArrayOf(1, 1, 3, ih.toLong(), iw.toLong()),
         ).use { input ->
-                sess.run(mapOf(inputName to input)).use { out ->
-                    // ORT Java 的 get(String) 返回 Optional<OnnxTensor>
-                    val tensor = out.get("predicted_depth").orElse(null)
-                        ?: (out[0] as OnnxTensor)
-                    val info = tensor.info as TensorInfo
-                    // DA3 导出是 rank-4 `[1,1,H,W]`；旧 DA2 是 rank-3 `[1,H,W]`。两种都认。
-                    when (info.shape.size) {
-                        4 -> {
-                            oh = info.shape[2].toInt()
-                            ow = info.shape[3].toInt()
-                        }
-                        3 -> {
-                            oh = info.shape[1].toInt()
-                            ow = info.shape[2].toInt()
-                        }
-                        else -> error("推理输出维度异常：${info.shape.contentToString()}")
+            sess.run(mapOf(inputName to input)).use { out ->
+                // ORT 1.31 的 get(String) 返回 Optional<OnnxValue>，得安全转成 OnnxTensor
+                // 后才能拿 floatBuffer / info（直接用会 Unresolved，2026-11-02 CI 实测）。
+                val tensor = (out.get("predicted_depth").orElse(null) as? OnnxTensor)
+                    ?: (out[0] as OnnxTensor)
+                val info = tensor.info as TensorInfo
+                // DA3 导出是 rank-4 `[1,1,H,W]`；旧 DA2 是 rank-3 `[1,H,W]`。两种都认。
+                when (info.shape.size) {
+                    4 -> {
+                        oh = info.shape[2].toInt()
+                        ow = info.shape[3].toInt()
                     }
-                    check(ow > 0 && oh > 0) { "推理输出尺寸异常：${ow}×$oh" }
-                    Log.i(TAG, "推理输出 ${ow}×$oh（输入 ${iw}×$ih）")
-                    val fb = tensor.floatBuffer
-                    depth = if (ow * oh == buf.n) buf.depth else FloatArray(ow * oh)
-                    fb.get(depth)
+                    3 -> {
+                        oh = info.shape[1].toInt()
+                        ow = info.shape[2].toInt()
+                    }
+                    else -> error("推理输出维度异常：${info.shape.contentToString()}")
                 }
+                check(ow > 0 && oh > 0) { "推理输出尺寸异常：${ow}×$oh" }
+                Log.i(TAG, "推理输出 ${ow}×$oh（输入 ${iw}×$ih）")
+                val fb = tensor.floatBuffer
+                depth = if (ow * oh == buf.n) buf.depth else FloatArray(ow * oh)
+                fb.get(depth)
             }
+        }
 
         // 五、min-max 归一化 → 灰度（越亮 = 越近）
         var lo = Float.MAX_VALUE
