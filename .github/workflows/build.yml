@@ -22,13 +22,15 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
+      # 不用 android-actions/setup-android：它的默认包 `tools` 已被 Google 下架，
+      # sdkmanager 直接报 "Failed to find package 'tools'"（2026-11-02 首跑实测）。
+      # ubuntu-latest 镜像自带 Android SDK，sdkmanager 兜底从 ANDROID_HOME 解析。
       - name: Install SDK packages (platform 37 / build-tools / NDK / CMake)
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-37" "build-tools;37.0.0" \
+          SDKMANAGER="$(command -v sdkmanager || echo "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager")"
+          echo "using: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "platforms;android-37" "build-tools;37.0.0" \
             "ndk;28.2.13676358" "cmake;3.22.1" platform-tools
 
       - name: Set up Gradle
