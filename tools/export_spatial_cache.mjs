@@ -9,9 +9,17 @@
  *   node tools/export_spatial_cache.mjs D:/pic/a.jpg \
  *     ../app/src/main/assets/models/da3_base_int8.onnx 1024 out/a.zip
  *
+ * 按模型族自动适配（文件名判别）：
+ * * `da3_*` —— 输出是「距离」（越大越远）：**翻转 + 双峰整形**（与
+ *   SpatialDepth.INVERT_DEPTH / shapeBimodal 同参数）。整形用 Otsu 找谷；
+ *   注意：某些极端构图（如仰拍、猫头与天空值域纠缠）下 DA3 的距离输出
+ *   **无阈值可分**，这类图建议直接用 dav2 导出。
+ * * `dav2_*` —— 输出是「视差」（越大越近）：**不翻转、不整形**，与旧版设备行为
+ *   完全一致（管线当年就是按它的双峰分布调的）。
+ *
  * 产物（zip 内三个文件，平铺、无子目录）：
  *   source     —— 图片原始字节（与 App 选图时拷入的 source 完全一致）
- *   depth.png  —— 灰度深度图，**越亮 = 越近**（min-max + INVERT，与 SpatialDepth 同构）
+ *   depth.png  —— 灰度深度图，**越亮 = 越近**
  *   meta.json  —— 与 App 相同 schema（model 字段以模型文件名开头，供缓存校验）
  *
  * 缓存键 = sha256(source).hex 前 16 位（与 App 的 sha16 一致）；zip 名即 <key>.zip。
@@ -32,8 +40,7 @@ import ort from "onnxruntime-node";
 const MEAN = [0.485, 0.456, 0.406];
 const STD = [0.229, 0.224, 0.225];
 const MULT = 14;
-/** 与 SpatialDepth.INVERT_DEPTH 一致：DA3 输出是距离（越大越远），翻转成越亮=越近。 */
-const INVERT_DEPTH = true;
+// 翻转与整形按模型族在 main() 里决定（da3=距离制需翻转+整形；dav2=视差制原样）。
 
 function decodeImage(path) {
   const buf = readFileSync(path);
@@ -129,6 +136,10 @@ async function main() {
     console.error(`shortSide 必须是 App 合法档位之一（768/896/1024），收到: ${shortSide}`);
     process.exit(2);
   }
+  // 模型族：dav2=视差制（近亮，原样输出）；da3=距离制（需翻转 + 双峰整形）
+  const isDa2 = modelName.startsWith("dav2");
+  const invert = !isDa2;
+  console.log(`模型族: ${isDa2 ? "dav2（视差：不翻转、不整形）" : "da3（距离：翻转+整形）"}`);
 
   const sourceBytes = readFileSync(photoPath);
 
@@ -145,7 +156,8 @@ async function main() {
   const session = await ort.InferenceSession.create(modelPath, {
     executionProviders: ["cpu"],
   });
-  const input = new ort.Tensor("float32", chw, [1, 1, 3, h, w]);
+  // dav2 是经典 NCHW [1,3,H,W]；da3 是多视图导出 [1,S,3,H,W]（单图 S=1）
+  const input = new ort.Tensor("float32", chw, isDa2 ? [1, 3, h, w] : [1, 1, 3, h, w]);
   const t0 = performance.now();
   const results = await session.run({ [session.inputNames[0]]: input });
   const costMs = Math.round(performance.now() - t0);
@@ -172,19 +184,21 @@ async function main() {
   const gray = new Uint8Array(n);
   for (let i = 0; i < n; i++) {
     const norm = (data[i] - lo) / range;
-    gray[i] = Math.round((INVERT_DEPTH ? 1 - norm : norm) * 255);
+    gray[i] = Math.round((invert ? 1 - norm : norm) * 255);
   }
 
-  // --- 双峰整形（与 SpatialDepth.shapeBimodal 同参数）---
+  // --- 双峰整形（与 SpatialDepth.shapeBimodal 同参数；仅 DA3，dav2 跳过）---
   // DA3 输出「距离」，远景是拉开的渐变：直接分层会背景散（σ 0.098 vs DA2 0.044）、
   // 主体糊（轮廓梯度 1.5 vs 3.6）、主体内按米级差异乱动（面部抖动的根源）。
   // 分段单调曲线重塑成 DA2 风格双峰。**切点用 Otsu（类间方差最大化）找「亮主体 vs 其余」
   // 的谷** —— 固定百分位会在背景自身双峰（暗塔+中灰天空）内部下刀，把天空推进主体亮台
   // （2026-11-02 实测踩坑）。实测（猫/风景）：背 mean 0.05/σ 0.04、对比 0.68/0.72
   // （超 DA2 的 0.60）、天空带压暗 0.07、近景带 0.79、整体 σ ≈ DA2 定标点。
-  const SHAPE_RAMP = 0.05; // 过渡带半宽（Otsu 谷两侧各 0.05）
-  const SHAPE_BG = 0.10, SHAPE_MID = 0.60, SHAPE_GAMMA_BG = 3, SHAPE_GAMMA_SUBJ = 1.5;
-  {
+  // ⚠️ 例外：若某图的主体与天空**值域纠缠**（如仰拍猫头，均在灰阶 100~150 混作一团），
+  // 任何阈值都分不开 —— 那类图用 dav2 模型导出（视差天然分离）。
+  if (!isDa2) {
+    const SHAPE_RAMP = 0.05; // 过渡带半宽（Otsu 谷两侧各 0.05）
+    const SHAPE_BG = 0.10, SHAPE_MID = 0.60, SHAPE_GAMMA_BG = 3, SHAPE_GAMMA_SUBJ = 1.5;
     const hist = new Int32Array(256);
     for (let i = 0; i < n; i++) hist[gray[i]]++;
     // Otsu：最大化类间方差 ⇒ 亮主体 vs 其余的最优切点（0..255）
@@ -213,6 +227,7 @@ async function main() {
         gray[i] = Math.max(0, Math.min(255, Math.round(s * 255)));
       }
     }
+    console.log(`双峰整形: Otsu T=${tOtsu} 过渡带 ${a}~${b}`);
   }
 
   const png = new PNG({ width: ow, height: oh });

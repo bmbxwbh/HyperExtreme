@@ -103,12 +103,12 @@ object SpatialImport {
             val missing = ALLOWED - found
             check(missing.isEmpty()) { "压缩包缺少文件：${missing.joinToString()}" }
 
-            // 三、meta 校验：模型与档位必须是当前 App 认的
-            // （meta.model 以**裸文件名**开头 —— 与 SpatialDepth.metaMatches 同口径；
+            // 三、meta 校验：模型在受支持清单内（dav2-small/large 导入 + DA3 双模型）、档位合法
+            // （meta.model 以**裸文件名**开头，与 SpatialDepth.metaUsable 同口径；
             //   不能用 MODEL_ASSETS.values，那是带 models/ 前缀的 asset 路径）
             val meta = JSONObject(File(work, ENTRY_META).readText())
             val model = meta.optString("model")
-            check(SpatialDepth.MODEL_NAMES.values.any { model.startsWith(it) }) {
+            check(SpatialDepth.SUPPORTED_CACHE_MODELS.any { model.startsWith(it) }) {
                 "包内模型不受支持：$model"
             }
             val shortSide = meta.optInt("shortSide", -1)

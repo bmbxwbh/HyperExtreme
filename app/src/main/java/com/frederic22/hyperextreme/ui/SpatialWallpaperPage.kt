@@ -127,7 +127,8 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
     }
     var shortSide by remember { mutableStateOf(prefs.spatialShortSide) }
     // 「推理模型」：DA3-Base（默认，质量优先）/ DA3-Small（速度优先），存在 MaskPrefs 里。
-    // 切换只影响**下一次**生成；旧深度缓存靠 meta.model 校验自动失效重算。
+    // 切换只影响**下一次真正重算**（强制重算窗口/换档位）；已有缓存（含导入的
+    // dav2/da3 异模型包）仍然命中、不会被界面选择覆盖（2026-11-02 语义调整）。
     var modelChoice by remember { mutableStateOf(prefs.spatialModel) }
     // 「空间壁纸生效范围」：0 锁屏（默认）/ 1 桌面 / 2 全局。**不影响层图生成**，只决定渲染器挂哪条 leash。
     var scopeChoice by remember { mutableStateOf(prefs.spatialScope) }
@@ -577,7 +578,7 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                                     checking = true
                                     val key = withContext(Dispatchers.IO) {
                                         runCatching {
-                                            SpatialDepth.hasCache(ctx, uri, shortSide, modelChoice)
+                                            SpatialDepth.hasCache(ctx, uri, shortSide)
                                         }.getOrNull()
                                     }
                                     checking = false
@@ -765,7 +766,8 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
             // 「推理模型」（2026-11-02 DA3 换代，用户要求加入模型选择）：
             // Base = DA3-Base 0.12B（默认，质量优先，768 下预计 20~25s）；
             // Small = DA3-Small（约 5s，与换代前体验相当）。
-            // **不锁 busy**：只影响下一次生成；旧深度缓存靠 meta.model 校验自动失效重算。
+            // **不锁 busy**：只影响下一次真正重算；已有缓存（含导入的异模型包）照常命中，
+            // 要按新选择重算走「10s 内再点一次」的强制窗口。
             DropdownRow(
                 title = "推理模型",
                 summary = "Base 更准更慢，Small 更快",

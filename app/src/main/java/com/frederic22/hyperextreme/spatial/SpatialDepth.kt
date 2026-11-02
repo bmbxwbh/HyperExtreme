@@ -49,9 +49,10 @@ import kotlin.math.roundToInt
  *
  * ## 缓存
  *
- * `files/spatial/<sha256前16位>/depth.png`（灰度，**越亮 = 越近**，min-max 归一化到 0~255）
- * + 同目录 `meta.json`。缓存键 = **图片内容 sha256 前 16 位**；命中还必须
- * **`meta.model` 与 `meta.shortSide` 都对得上**（换模型/换档位自动重算，DA2 旧缓存作废）。
+ * `files/spatial/<sha256前16位>/depth.png`（灰度，**越亮 = 越近**，min-max 归一化到 0~255
+ * + DA3 再做双峰整形）+ 同目录 `meta.json`。缓存键 = **图片内容 sha256 前 16 位**；
+ * 命中还必须 **`meta.model` ∈ [SUPPORTED_CACHE_MODELS] 且 `meta.shortSide` 一致**
+ * （模型选择只决定下一次重算用谁；换档位/强制重算走重算，异模型导入包不会被界面选择覆盖）。
  *
  * ## 三个必须照做的坑（见《07-坑点台账.md》§7.13）
  *
@@ -79,6 +80,18 @@ internal object SpatialDepth {
     val MODEL_NAMES: Map<String, String> = MODEL_ASSETS.mapValues { (_, asset) ->
         asset.substringAfterLast('/')
     }
+
+    /**
+     * 缓存 meta.model 允许的文件名清单 —— **能进缓存的 ≠ 能在手机上生成的**：
+     * 除了 [MODEL_NAMES]（机内可生成的 DA3 双模型），还接受 PC 导入的
+     * dav2-small / dav2-large（视差型输出，对本管线的分层结构最友好 ——
+     * 2026-11-02 猫图实测：DA2 天空纯黑/猫头锐利，DA3 距离制与天空值域纠缠分不开）。
+     * dav2 只能**导入**使用（APK 不带它的权重，机内生成不会选它）。
+     */
+    val SUPPORTED_CACHE_MODELS: List<String> = listOf(
+        "dav2_small_int8.onnx",
+        "dav2_large_fp32.onnx",
+    ) + MODEL_NAMES.values
 
     /**
      * DA3 输出方向翻转：官方 `predicted_depth` 是**距离**（越大越远），而本管线约定
@@ -134,28 +147,34 @@ internal object SpatialDepth {
     fun cacheKey(ctx: Context, uri: Uri): String = sha16(ctx, uri)
 
     /**
-     * 该图是否已有**与当前参数匹配**的深度缓存：有则返回缓存键，没有返回 null。
+     * 该图是否已有**可用**的深度缓存：有则返回缓存键，没有返回 null。
      *
-     * 命中条件 = `depth.png`/`meta.json` 存在 **且** `meta.model` 以当前模型文件名开头
-     * **且** `meta.shortSide` 等于目标档位 —— 换模型、换档位、DA2 旧缓存都会走重算。
+     * 命中条件 = `depth.png`/`meta.json` 存在 **且** `meta.model` 属于 [SUPPORTED_CACHE_MODELS]
+     * **且** `meta.shortSide` 等于目标档位。
+     *
+     * ⚠️ **不再要求 meta.model 等于当前界面选择**（2026-11-02 语义调整）：缓存包可以
+     * 导入任意受支持模型的深度（dav2-small/large、da3-small/base，PC 算什么导什么），
+     * 这类"异模型"缓存必须能命中、否则刚导入就被界面选择覆盖重算。
+     * 界面的模型选择只决定**下一次真正重算**（强制重算窗口/档位变化）用哪个模型。
      *
      * ⚠️ 会**完整读一遍图片算 sha256**（几十到几百毫秒），调用方放 IO 线程。
      */
-    fun hasCache(ctx: Context, uri: Uri, shortSide: Int, model: String): String? {
+    fun hasCache(ctx: Context, uri: Uri, shortSide: Int): String? {
         val key = sha16(ctx, uri)
         val dir = File(cacheRoot(ctx), key)
         if (!File(dir, "depth.png").isFile || !File(dir, "meta.json").isFile) return null
-        return if (metaMatches(File(dir, "meta.json"), model, shortSide)) key else null
+        return if (metaUsable(File(dir, "meta.json"), shortSide)) key else null
     }
 
-    /** meta 是否与本次请求的模型/档位一致（读失败一律视为不命中 → 重算）。 */
-    private fun metaMatches(metaFile: File, model: String, shortSide: Int): Boolean {
-        val fileName = MODEL_NAMES[model] ?: return false
-        return runCatching {
-            val meta = JSONObject(metaFile.readText())
-            meta.optString("model").startsWith(fileName) && meta.optInt("shortSide") == shortSide
-        }.getOrDefault(false)
-    }
+    /**
+     * meta 是否可用：模型在 [SUPPORTED_CACHE_MODELS] 清单内 **且** 档位一致。
+     * 读失败一律视为不可用（→ 重算）。
+     */
+    private fun metaUsable(metaFile: File, shortSide: Int): Boolean = runCatching {
+        val meta = JSONObject(metaFile.readText())
+        val model = meta.optString("model")
+        SUPPORTED_CACHE_MODELS.any { model.startsWith(it) } && meta.optInt("shortSide") == shortSide
+    }.getOrDefault(false)
 
     /** 缓存目录里的原图文件（可能不存在）。 */
     fun sourceFile(depthDir: File): File = File(depthDir, SOURCE_NAME)
@@ -265,7 +284,7 @@ internal object SpatialDepth {
         // 原图副本：缓存命中也补写一次（旧缓存只有 preview.webp，用户要求换成原图）
         ensureSource(ctx, uri, dir)
         // 命中必须模型+档位都对（换模型/换档位/DA2 旧缓存 → 自动重算）
-        if (!force && depthFile.isFile && metaFile.isFile && metaMatches(metaFile, modelKey, target)) {
+        if (!force && depthFile.isFile && metaFile.isFile && metaUsable(metaFile, target)) {
             Log.i(TAG, "缓存命中 $key（$fileName @$target）")
             return Result(dir, 0L, true)
         }
