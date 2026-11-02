@@ -42,8 +42,26 @@ const STD = [0.229, 0.224, 0.225];
 const MULT = 14;
 // 翻转与整形按模型族在 main() 里决定（da3=距离制需翻转+整形；dav2=视差制原样）。
 
-function decodeImage(path) {
+async function decodeImage(path) {
   const buf = readFileSync(path);
+  if (path.toLowerCase().endsWith(".webp")) {
+    // sharp 直接内存解码 webp（无需先转格式）；系统无 dwebp 时的方案，2026-11-03
+    const sharp = (await import("sharp")).default;
+    const { data, info } = await sharp(buf)
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const px = new Uint32Array(info.width * info.height);
+    for (let i = 0; i < px.length; i++) {
+      const o = i * 4;
+      px[i] =
+        ((data[o + 3] & 0xff) << 24) |
+        ((data[o] & 0xff) << 16) |
+        ((data[o + 1] & 0xff) << 8) |
+        (data[o + 2] & 0xff);
+    }
+    return { width: info.width, height: info.height, px };
+  }
   if (path.toLowerCase().endsWith(".png")) {
     const png = PNG.sync.read(buf);
     const px = new Uint32Array(png.width * png.height);
@@ -144,7 +162,7 @@ async function main() {
   const sourceBytes = readFileSync(photoPath);
 
   // --- 预处理（与 SpatialDepth.generate 同构） ---
-  const src = decodeImage(photoPath);
+  const src = await decodeImage(photoPath);
   const scale = shortSide / Math.min(src.width, src.height);
   const w = Math.max(MULT, Math.floor(Math.round(src.width * scale) / MULT) * MULT);
   const h = Math.max(MULT, Math.floor(Math.round(src.height * scale) / MULT) * MULT);
